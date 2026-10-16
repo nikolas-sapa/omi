@@ -2031,6 +2031,14 @@ async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_
     return response
 
 
+# The TimeoutMiddleware cap (HTTP_SYNC_JOBS_RUN_TIMEOUT, 1500s) answers 504
+# without cancelling the pipeline coroutine, so on Starlette's BaseHTTPMiddleware
+# the request stays open until the pipeline returns and Cloud Run terminates it
+# at the service's maximum request timeout instead. The pipeline must end the
+# attempt itself, below that cap, so Cloud Tasks gets its retry response in time.
+SYNC_JOB_HANDLER_BUDGET_SECONDS = float(os.getenv('SYNC_JOB_HANDLER_BUDGET_SECONDS', '1380'))
+
+
 @sync_attempt
 async def _run_sync_job_body(request: Request, task_retry_count: int):
     """Cloud Tasks handler: runs one sync job inside the request.
@@ -2238,28 +2246,34 @@ async def _run_sync_job_body(request: Request, task_retry_count: int):
 
         job_dir = f'syncing/{uid}/{job_id}'
         try:
-            await _run_full_pipeline_background_async(
-                job_id,
-                uid,
-                blob_paths,
-                source,
-                should_lock,
-                job_dir,
-                conversation_id,
-                geolocation=geolocation,
-                task_mode=True,
-                client_device_id=client_device_id,
-                client_platform=client_platform,
-                sync_lane=sync_lane,
-                content_id=content_id,
-                run_lock_token=lock_token if ledger_fence_active else None,
-                content_run_bound=ledger_fence_active,
-                ledger_fence_active=ledger_fence_active,
-                **({'raw_capture_paths': raw_capture_paths} if raw_capture_paths else {}),
-                **({'capture_evidence_claims': capture_claims} if capture_claims else {}),
-                recording_session_id=recording_session_id,
-                audio_start_seconds=audio_start_seconds,
-                audio_end_seconds=audio_end_seconds,
+            # A budget expiry cancels the coordinator like a lease loss: segments
+            # already recorded stay done, staged audio is kept, and the TimeoutError
+            # below reaches the generic retry path as a retryable failure.
+            await asyncio.wait_for(
+                _run_full_pipeline_background_async(
+                    job_id,
+                    uid,
+                    blob_paths,
+                    source,
+                    should_lock,
+                    job_dir,
+                    conversation_id,
+                    geolocation=geolocation,
+                    task_mode=True,
+                    client_device_id=client_device_id,
+                    client_platform=client_platform,
+                    sync_lane=sync_lane,
+                    content_id=content_id,
+                    run_lock_token=lock_token if ledger_fence_active else None,
+                    content_run_bound=ledger_fence_active,
+                    ledger_fence_active=ledger_fence_active,
+                    **({'raw_capture_paths': raw_capture_paths} if raw_capture_paths else {}),
+                    **({'capture_evidence_claims': capture_claims} if capture_claims else {}),
+                    recording_session_id=recording_session_id,
+                    audio_start_seconds=audio_start_seconds,
+                    audio_end_seconds=audio_end_seconds,
+                ),
+                timeout=SYNC_JOB_HANDLER_BUDGET_SECONDS,
             )
         except SyncConversationPersistenceFenced:
             latest_job = await run_blocking(db_executor, get_sync_job, job_id) or job

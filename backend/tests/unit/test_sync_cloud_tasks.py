@@ -3758,3 +3758,51 @@ async def test_cohort_prior_legacy_receipt_retains_original_claim_and_dispatch(m
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
+    """A pipeline that outlives the in-request budget must be cancelled and handed
+    back to Cloud Tasks as a retryable failure. Without the budget, the 504 from
+    TimeoutMiddleware does not cancel the pipeline, the request stays open until
+    the work finishes, and Cloud Run terminates it at the service's maximum
+    request timeout — the platform kill this guards against."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    request = _configure_task_handler(
+        module,
+        pipeline_error=RuntimeError('pipeline must not complete'),
+        latest_job={
+            'job_id': 'job-1',
+            'status': 'processing',
+            'stt_provider': 'deepgram',
+            'stt_model': 'nova-3',
+        },
+    )
+
+    async def _pipeline_that_never_finishes(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    try:
+        # Below HTTP_SYNC_JOBS_RUN_TIMEOUT (1500s) and the Cloud Tasks dispatch
+        # deadline, leaving room for the retry response to reach the queue.
+        assert 0 < module.SYNC_JOB_HANDLER_BUDGET_SECONDS < 1500
+        module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
+        module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+
+        response = await module.run_sync_job(request, task_retry_count=0)
+
+        assert response.status_code == 500
+        assert json.loads(response.body) == {'status': 'retry'}
+        module.fenced_mark_job_queued_for_retry.assert_called_once_with('job-1', '1:lock-token', 1, 'stt_timeout')
+        module._finalize_sync_job_failure.assert_not_awaited()
+        module._delete_staged_blobs_async.assert_not_awaited()
+        module.release_job_run_lock.assert_called_once_with('job-1', '1:lock-token')
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
