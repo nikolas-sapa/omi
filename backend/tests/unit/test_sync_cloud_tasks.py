@@ -3762,11 +3762,12 @@ async def test_cohort_prior_legacy_receipt_retains_original_claim_and_dispatch(m
 
 @pytest.mark.asyncio
 async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
-    """A pipeline that outlives the in-request budget must be cancelled and handed
-    back to Cloud Tasks as a retryable failure. Without the budget, the 504 from
-    TimeoutMiddleware does not cancel the pipeline, the request stays open until
-    the work finishes, and Cloud Run terminates it at the service's maximum
-    request timeout — the platform kill this guards against."""
+    """A pipeline that outlives the in-request budget must be cancelled and the
+    attempt handed back to Cloud Tasks without releasing ownership. Without the
+    budget, the 504 from TimeoutMiddleware does not cancel the pipeline, the
+    request stays open until the work finishes, and Cloud Run terminates it at
+    the service's maximum request timeout — the platform kill this guards
+    against."""
 
     module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
     request = _configure_task_handler(
@@ -3786,18 +3787,103 @@ async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
     try:
         # Below HTTP_SYNC_JOBS_RUN_TIMEOUT (1500s) and the Cloud Tasks dispatch
         # deadline, leaving room for the retry response to reach the queue.
-        assert 0 < module.SYNC_JOB_HANDLER_BUDGET_SECONDS < 1500
+        assert 0 < module.SYNC_JOB_HANDLER_BUDGET_SECONDS < module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS
         module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
         module._run_full_pipeline_background_async = _pipeline_that_never_finishes
 
         response = await module.run_sync_job(request, task_retry_count=0)
 
-        assert response.status_code == 500
-        assert json.loads(response.body) == {'status': 'retry'}
-        module.fenced_mark_job_queued_for_retry.assert_called_once_with('job-1', '1:lock-token', 1, 'stt_timeout')
+        # A budget expiry is a lease loss, not a generic retry: an executor
+        # leaf can still be mutating state under this token, so the job stays
+        # owned (no queued-reset, no terminal failure, no staged-blob delete,
+        # no lock release) and the 409 defers redelivery until the lease TTL.
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'status': 'locked'}
+        module.fenced_mark_job_queued_for_retry.assert_not_called()
         module._finalize_sync_job_failure.assert_not_awaited()
         module._delete_staged_blobs_async.assert_not_awaited()
-        module.release_job_run_lock.assert_called_once_with('job-1', '1:lock-token')
+        module.release_job_run_lock.assert_not_called()
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sync_task_budget_counts_pre_pipeline_io_from_handler_entry():
+    """The budget must anchor at handler entry, not at the pipeline call: a
+    slow staged-file download consumes the same request clock the middleware
+    measures, so expiry during pre-pipeline I/O must still end the attempt
+    with ownership preserved instead of letting the pipeline start with a
+    budget the platform timeout can outlive."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    request = _configure_task_handler(
+        module,
+        pipeline_error=RuntimeError('pipeline must not start'),
+        latest_job={
+            'job_id': 'job-1',
+            'status': 'processing',
+            'stt_provider': 'deepgram',
+            'stt_model': 'nova-3',
+        },
+    )
+    passthrough_run_blocking = module.run_blocking
+
+    async def _download_hangs(_executor, fn, *args, **kwargs):
+        if fn is module._download_staged_files:
+            await asyncio.sleep(30)
+        return await passthrough_run_blocking(_executor, fn, *args, **kwargs)
+
+    try:
+        module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
+        module.run_blocking = _download_hangs
+
+        response = await module.run_sync_job(request, task_retry_count=0)
+
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'status': 'locked'}
+        module._run_full_pipeline_background_async.assert_not_awaited()
+        module._finalize_sync_job_failure.assert_not_awaited()
+        module._delete_staged_blobs_async.assert_not_awaited()
+        module.release_job_run_lock.assert_not_called()
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+def test_sync_task_handler_budget_derives_from_route_timeout():
+    """The budget must track the configured route timeout so the middleware
+    deadline can never fire first and reintroduce the lingering 504 path."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    resolve = module._resolve_sync_job_handler_budget
+    try:
+        # Default derives from the configured route cap minus the margin.
+        assert resolve(1500.0, None) == 1380.0
+        assert resolve(1500.0, '') == 1380.0
+        assert resolve(600.0, None) == 480.0
+        # An explicit override still wins for the local stacks (20s under 30s).
+        assert resolve(30.0, '20') == 20.0
+        # Any budget that is not strictly below the route cap fails at startup.
+        with pytest.raises(ValueError):
+            resolve(30.0, '30')
+        with pytest.raises(ValueError):
+            resolve(1500.0, '1600')
+        with pytest.raises(ValueError):
+            resolve(0.0, None)
+        # A route cap smaller than the margin cannot derive a valid budget.
+        with pytest.raises(ValueError):
+            resolve(100.0, None)
     finally:
         sys.modules.pop('routers.sync', None)
         sys.modules.pop('utils.sync.pipeline', None)
