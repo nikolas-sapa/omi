@@ -124,7 +124,7 @@ from utils.metrics import (
 )
 from utils.sync.poll_limit import SYNC_POLL_WINDOW_SECONDS, admit_sync_job_poll, with_poll_hint
 from config.repeat_work import playback_on_demand
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from utils.sync.repeat_work_metrics import PLAYBACK_BUILD_SECONDS, PLAYBACK_BUILDS, record_playback_ready
 from utils.product_metrics import record_product_event, sanitize_app_build
 from utils.journey_metrics_contract import resolve_client_kind
@@ -1928,6 +1928,14 @@ async def wake_sync_backfill_uid(request: Request, _retry_count: int = Depends(v
     return JSONResponse(status_code=200, content={'status': 'dispatched' if dispatched else 'deferred'})
 
 
+# The heartbeat's Firestore renewal is an executor leaf the stop event cannot
+# interrupt, so joining it after an attempt must be bounded: an unbounded join
+# would hold the deferral response open past the middleware/dispatch walls the
+# handler budget just defended against. Past the bound the heartbeat is
+# cancelled — the renewal thread may still finish, but this response returns.
+SYNC_JOB_SEQUENCER_HEARTBEAT_DRAIN_SECONDS = 5.0
+
+
 @router.post("/v2/sync-jobs/run", include_in_schema=False)
 async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_cloud_tasks_oidc)):
     """Persisted sequencer epochs survive the kill switch; old tasks keep their legacy path."""
@@ -2022,7 +2030,12 @@ async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_
         response = await _run_sync_job_body(request, effective_retry_count)
     finally:
         stop.set()
-        await heartbeat
+        try:
+            await asyncio.wait_for(asyncio.shield(heartbeat), timeout=SYNC_JOB_SEQUENCER_HEARTBEAT_DRAIN_SECONDS)
+        except TimeoutError:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
     if response.status_code < 300 and not _is_handler_budget_deferral(response):
         # A budget deferral is an ack, not a completion claim: the epoch still
         # owns the job and the delayed replacement (or the sweep's lease-expiry
@@ -2147,6 +2160,13 @@ def _budget_deferral_fallback(reason: str, outcome: str) -> JSONResponse:
     return JSONResponse(status_code=409, content={'status': 'locked'})
 
 
+# Best-effort bound for undoing the deferred marker after a failed replacement
+# enqueue: the enqueue may itself have timed out at the post-budget deadline,
+# so this write must only consume a small slice of the remaining response
+# headroom, never a fresh margin-sized timeout.
+SYNC_JOB_DEFERRED_MARKER_CLEAR_TIMEOUT_SECONDS = 5.0
+
+
 async def _mark_sync_job_deferred_until(job_id: str, deferred_until: float) -> None:
     """Marker read by is_sync_job_stale: the preserved run lock expires before
     the replacement is due, and a status poll in that unlocked gap would
@@ -2216,14 +2236,25 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
                     type(error).__name__,
                 )
                 return _budget_deferral_fallback('marker_failed', 'degraded')
-            # If the enqueue now fails, polling only resumes stale detection
-            # at the instant the replacement would have run.
             await run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at)
     except Exception as error:
         logger.warning(
             'event=sync_transcription_job outcome=handler_budget_replacement_failed exception_type=%s',
             type(error).__name__,
         )
+        # The marker names a replacement that was never scheduled. Left in
+        # place it keeps is_sync_job_stale from self-healing this job long
+        # past the preserved run lock's TTL — the 409's queue-owned retries
+        # exhaust inside that TTL, so polling must stay armed for them.
+        # Best-effort: a lost clear only keeps the marker's own delay.
+        try:
+            async with asyncio.timeout(SYNC_JOB_DEFERRED_MARKER_CLEAR_TIMEOUT_SECONDS):
+                await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': None})
+        except Exception as clear_error:
+            logger.warning(
+                'event=sync_transcription_job outcome=handler_budget_deferral_marker_clear_failed exception_type=%s',
+                type(clear_error).__name__,
+            )
         return _budget_deferral_fallback('enqueue_failed', 'degraded')
     if payload.get('sequencer_epoch') is not None:
         # Sequenced deliveries only: a lease that expires before the delayed
@@ -2276,23 +2307,30 @@ async def _run_sync_job_body(request: Request, task_retry_count: int):
     executor leaf that cancellation cannot stop. Because that lock outlives
     every queue-level retry, the attempt acks and schedules one delayed
     replacement instead of returning a 409 that would burn the task's retry
-    budget against the preserved lock. (Post-attempt sequencer cleanup in the
-    caller stays outside the budget on purpose: once an attempt has produced
-    its response, expiring there must not rewrite it.)
+    budget against the preserved lock. An expiry before the attempt reaches
+    the run lock holds nothing — no lock, no mutating leaf — and keeps the
+    queue-owned 409, whose backoff-scaled retries can re-enter immediately
+    instead of idling through the lock-sized replacement delay. (Post-attempt
+    sequencer cleanup in the caller stays outside the budget on purpose: once
+    an attempt has produced its response, expiring there must not rewrite it.)
     """
+    attempt_state: dict = {}
     budget = asyncio.timeout(SYNC_JOB_HANDLER_BUDGET_SECONDS)
     try:
         async with budget:
-            return await _run_sync_job_attempt(request, task_retry_count)
+            return await _run_sync_job_attempt(request, task_retry_count, attempt_state)
     except TimeoutError:
         if not budget.expired():
             raise
+        if not attempt_state.get('run_lock_reached'):
+            logger.warning('event=sync_transcription_job outcome=handler_budget_expired lock=not_acquired')
+            return JSONResponse(status_code=409, content={'status': 'locked'})
         logger.warning('event=sync_transcription_job outcome=handler_budget_expired lock=preserved')
         return await _defer_sync_job_after_handler_budget_expiry(request)
 
 
 @sync_attempt
-async def _run_sync_job_attempt(request: Request, task_retry_count: int):
+async def _run_sync_job_attempt(request: Request, task_retry_count: int, attempt_state: dict):
     """Cloud Tasks handler: runs one sync job inside the request.
 
     Auth is the Cloud Tasks OIDC token (verify_cloud_tasks_oidc), not Firebase.
@@ -2378,6 +2416,10 @@ async def _run_sync_job_attempt(request: Request, task_retry_count: int):
 
     # Fail-closed lock: Redis errors propagate → 500 → Cloud Tasks retries later.
     acquire_task_lock = try_acquire_sync_job_run_lock if ledger_fence_active else try_acquire_job_run_lock
+    # Flagged before the acquisition call, not after: a cancellation landing
+    # mid-acquire can still leave the Redis lock held, so the expiry handler
+    # must already treat this attempt as lock-owning (conservative deferral).
+    attempt_state['run_lock_reached'] = True
     lock_token = await run_blocking(db_executor, acquire_task_lock, job_id)
     if not lock_token:
         logger.warning(f'sync job {job_id}: run-lock held by another attempt, deferring')
