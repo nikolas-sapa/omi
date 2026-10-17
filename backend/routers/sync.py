@@ -2233,8 +2233,6 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
                     type(error).__name__,
                 )
                 return _budget_deferral_fallback('marker_failed', 'degraded')
-            # If the enqueue now fails, polling only resumes stale detection
-            # at the instant the replacement would have run.
             await run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at)
     except Exception as error:
         logger.warning(
@@ -2421,6 +2419,10 @@ async def _run_sync_job_attempt(request: Request, task_retry_count: int, attempt
     # must take the preserved-lock deferral rather than the pre-lock branch.
     attempt_state['run_lock_reached'] = True
     acquire_task_lock = try_acquire_sync_job_run_lock if ledger_fence_active else try_acquire_job_run_lock
+    # Flagged before the acquisition call, not after: a cancellation landing
+    # mid-acquire can still leave the Redis lock held, so the expiry handler
+    # must already treat this attempt as lock-owning (conservative deferral).
+    attempt_state['run_lock_reached'] = True
     lock_token = await run_blocking(db_executor, acquire_task_lock, job_id)
     if not lock_token:
         logger.warning(f'sync job {job_id}: run-lock held by another attempt, deferring')
