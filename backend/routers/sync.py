@@ -35,6 +35,7 @@ from database.sync_jobs import (
     SyncLedgerFenceMode,
     TERMINAL_STATUSES,
     RUN_LOCK_TTL_SECONDS,
+    STALE_THRESHOLD_SECONDS,
     create_sync_job,
     delete_sync_job,
     delete_sync_job_run_lock_epoch,
@@ -2079,10 +2080,26 @@ SYNC_JOB_HANDLER_BUDGET_SECONDS = _resolve_sync_job_handler_budget(
 # and schedules one replacement named task for after the lock is guaranteed gone;
 # the 409 stays only as the fallback when no replacement could be scheduled.
 SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS = RUN_LOCK_TTL_SECONDS + 60
-# The replacement enqueue runs after the budget has expired, so it gets its own
-# bound inside the response margin instead of an unbounded create-task call.
-SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS = SYNC_JOB_RESPONSE_MARGIN_SECONDS / 2
+
+
+def _resolve_sync_job_replacement_enqueue_timeout(route_timeout_seconds: float, budget_seconds: float) -> float:
+    # The replacement enqueue runs after the budget has expired, so it must fit
+    # inside the margin the configured budget actually leaves below the route
+    # cap — half of it, the other half being response headroom — rather than a
+    # fixed fraction of the default margin that an explicit override can exceed.
+    return (route_timeout_seconds - budget_seconds) / 2
+
+
+SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS = _resolve_sync_job_replacement_enqueue_timeout(
+    SYNC_JOB_ROUTE_TIMEOUT_SECONDS, SYNC_JOB_HANDLER_BUDGET_SECONDS
+)
 SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS = 'deferred_handler_budget'
+# Each replacement is a fresh named task whose queue-level retry count starts
+# at zero, so the chain carries its own count: once a job has spent the queue's
+# attempt contract in whole-budget attempts, no further replacement is
+# scheduled and the task ends through the queue instead of chaining until the
+# staged audio expires.
+SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY = 'budget_deferrals'
 
 
 def _is_handler_budget_deferral(response: JSONResponse) -> bool:
@@ -2092,6 +2109,33 @@ def _is_handler_budget_deferral(response: JSONResponse) -> bool:
         return False
 
 
+def _budget_deferral_fallback(reason: str, outcome: str) -> JSONResponse:
+    """The 409 keeps the queue — not this handler — owning the retry; record the
+    switch so the deferred-recovery path cannot fail dark."""
+    record_fallback(
+        component='sync_dispatch',
+        from_mode='budget_replacement',
+        to_mode='queue_retry',
+        reason=reason,
+        outcome=outcome,
+    )
+    return JSONResponse(status_code=409, content={'status': 'locked'})
+
+
+async def _mark_sync_job_deferred_until(job_id: str, deferred_until: float) -> None:
+    """Best-effort marker read by is_sync_job_stale: the preserved run lock
+    expires before the replacement is due, and a status poll in that unlocked
+    gap would otherwise acquire the lock and terminally fail a job whose
+    continuation is already scheduled."""
+    try:
+        await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': deferred_until})
+    except Exception as error:
+        logger.warning(
+            'event=sync_transcription_job outcome=handler_budget_deferral_marker_failed exception_type=%s',
+            type(error).__name__,
+        )
+
+
 async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONResponse:
     """Ack a budget-expired attempt against a replacement scheduled past the
     preserved run lock's TTL. Queue-level retries cannot outlive that lock, so
@@ -2099,21 +2143,48 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
     replacement can be scheduled, the 409 fallback keeps the queue — not this
     handler — owning the retry."""
     if not is_cloud_tasks_dispatch_enabled():
-        return JSONResponse(status_code=409, content={'status': 'locked'})
+        return _budget_deferral_fallback('dispatch_disabled', 'degraded')
     try:
-        payload = await request.json()
-        schedule_at = int(time.time()) + SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
-        await asyncio.wait_for(
-            run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at),
-            timeout=SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS,
-        )
+        payload = dict(await request.json())
+        job_id = payload['job_id']
+        deferrals = payload.get(SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY, 0)
+        if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals < 0:
+            raise ValueError('budget deferral count must be a non-negative integer')
     except Exception as error:
         logger.warning(
             'event=sync_transcription_job outcome=handler_budget_replacement_failed exception_type=%s',
             type(error).__name__,
         )
-        return JSONResponse(status_code=409, content={'status': 'locked'})
-    logger.info('event=sync_transcription_job outcome=handler_budget_deferred replacement_at=%d', schedule_at)
+        return _budget_deferral_fallback('malformed', 'degraded')
+    if deferrals + 1 >= get_sync_tasks_max_attempts():
+        # Original delivery plus replacements have used the whole attempt
+        # contract. Ending here through the queue leaves the lock preserved for
+        # any live leaf; once it expires, the stale self-heal on the status
+        # poll finalizes the job through the owned finalizer.
+        logger.error(
+            'event=sync_transcription_job outcome=handler_budget_deferrals_exhausted deferrals=%d',
+            deferrals,
+        )
+        return _budget_deferral_fallback('deferrals_exhausted', 'exhausted')
+    schedule_at = int(time.time()) + SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
+    payload[SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY] = deferrals + 1
+    try:
+        async with asyncio.timeout(SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS):
+            # Marker first: if the enqueue then fails, polling only resumes
+            # stale detection at the instant the replacement would have run.
+            await _mark_sync_job_deferred_until(job_id, schedule_at + STALE_THRESHOLD_SECONDS)
+            await run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at)
+    except Exception as error:
+        logger.warning(
+            'event=sync_transcription_job outcome=handler_budget_replacement_failed exception_type=%s',
+            type(error).__name__,
+        )
+        return _budget_deferral_fallback('enqueue_failed', 'degraded')
+    logger.info(
+        'event=sync_transcription_job outcome=handler_budget_deferred replacement_at=%d deferrals=%d',
+        schedule_at,
+        deferrals + 1,
+    )
     return JSONResponse(status_code=200, content={'status': SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS})
 
 

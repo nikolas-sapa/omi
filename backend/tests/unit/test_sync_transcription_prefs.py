@@ -191,6 +191,7 @@ def _build_fakes() -> dict:
     cloud_tasks.enqueue_audio_merge_job = MagicMock()
     cloud_tasks.enqueue_audio_merge_job_deferred = MagicMock()
     cloud_tasks.enqueue_sync_job = MagicMock()
+    cloud_tasks.enqueue_sync_job_budget_replacement = MagicMock()
     cloud_tasks.get_sync_tasks_max_attempts = MagicMock(return_value=5)
     cloud_tasks.is_audio_merge_dispatch_enabled = MagicMock(return_value=False)
     cloud_tasks.is_cloud_tasks_dispatch_enabled = MagicMock(return_value=False)

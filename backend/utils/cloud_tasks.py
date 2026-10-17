@@ -68,7 +68,9 @@ SYNC_JOB_SEQUENCED_TASK_PAYLOAD_KEYS = SYNC_JOB_TASK_PAYLOAD_KEYS | {'sequencer_
 # Present only when the upload carried parsed S1 capture-evidence claims
 # (routers/sync.py). An exact-set check without this key raised ValueError at
 # enqueue for every claims-bearing upload and wedged that uid's sequencer.
-SYNC_JOB_OPTIONAL_TASK_PAYLOAD_KEYS = frozenset({'capture_evidence_claims'})
+# ``budget_deferrals`` rides only on handler-budget replacement tasks: the count
+# of whole-budget attempts the job has already spent (routers/sync.py).
+SYNC_JOB_OPTIONAL_TASK_PAYLOAD_KEYS = frozenset({'capture_evidence_claims', 'budget_deferrals'})
 
 
 def sync_job_payload_keys_valid(keys: Iterable[str], *, allow_sequenced: bool = True) -> bool:

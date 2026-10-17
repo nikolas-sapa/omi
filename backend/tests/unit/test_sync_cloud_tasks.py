@@ -1341,6 +1341,7 @@ def _load_sync_router_for_fast_path():
     mock_sync_jobs.mark_job_queued_for_retry = MagicMock()
     mock_sync_jobs.try_acquire_job_run_lock = MagicMock(return_value='legacy-lock-token')
     mock_sync_jobs.RUN_LOCK_TTL_SECONDS = 1800
+    mock_sync_jobs.STALE_THRESHOLD_SECONDS = 600
     sys.modules['database.sync_jobs'] = mock_sync_jobs
 
     sys.modules['utils.fair_use'].is_hard_restricted = MagicMock(return_value=False)
@@ -3770,7 +3771,7 @@ async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
     the service's maximum request timeout — the platform kill this guards
     against."""
 
-    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    module, saved_modules, _, _, fallback_calls, _ = _load_sync_router_for_fast_path()
     request = _configure_task_handler(
         module,
         pipeline_error=RuntimeError('pipeline must not complete'),
@@ -3791,6 +3792,7 @@ async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
         assert 0 < module.SYNC_JOB_HANDLER_BUDGET_SECONDS < module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS
         module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
         module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        module.update_sync_job = MagicMock(return_value={'job_id': 'job-1', 'status': 'processing'})
         before = time.time()
 
         response = await module.run_sync_job(request, task_retry_count=0)
@@ -3812,6 +3814,15 @@ async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
             <= schedule_at
             <= time.time() + module.SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
         )
+        # The replacement carries the chain count so repeated expiries end at
+        # the queue's attempt contract instead of chaining forever.
+        assert payload[module.SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY] == 1
+        # The preserved lock expires before the replacement is due; the job
+        # is marked deferred so a poll in that gap cannot finalize it stale.
+        module.update_sync_job.assert_called_once_with(
+            'job-1', {'deferred_until': schedule_at + module.STALE_THRESHOLD_SECONDS}
+        )
+        assert fallback_calls == []
         module.fenced_mark_job_queued_for_retry.assert_not_called()
         module._finalize_sync_job_failure.assert_not_awaited()
         module._delete_staged_blobs_async.assert_not_awaited()
@@ -3881,7 +3892,7 @@ async def test_sync_task_budget_expiry_falls_back_to_409_when_replacement_not_sc
     cannot be scheduled, the 409 keeps Cloud Tasks' own retry owning the
     redelivery exactly as before, preserved lock and all."""
 
-    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    module, saved_modules, _, _, fallback_calls, _ = _load_sync_router_for_fast_path()
     request = _configure_task_handler(
         module,
         pipeline_error=RuntimeError('pipeline must not complete'),
@@ -3899,6 +3910,7 @@ async def test_sync_task_budget_expiry_falls_back_to_409_when_replacement_not_sc
     try:
         module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
         module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        module.update_sync_job = MagicMock(return_value={'job_id': 'job-1', 'status': 'processing'})
         module.enqueue_sync_job_budget_replacement = MagicMock(side_effect=RuntimeError('create_task failed'))
 
         response = await module.run_sync_job(request, task_retry_count=0)
@@ -3907,6 +3919,17 @@ async def test_sync_task_budget_expiry_falls_back_to_409_when_replacement_not_sc
         assert json.loads(response.body) == {'status': 'locked'}
         module.enqueue_sync_job_budget_replacement.assert_called_once()
         module.release_job_run_lock.assert_not_called()
+        # Switching back to queue-owned retries is a fallback and must not
+        # fail dark: operators see it in the fallback telemetry.
+        assert fallback_calls == [
+            {
+                'component': 'sync_dispatch',
+                'from_mode': 'budget_replacement',
+                'to_mode': 'queue_retry',
+                'reason': 'enqueue_failed',
+                'outcome': 'degraded',
+            }
+        ]
     finally:
         sys.modules.pop('routers.sync', None)
         sys.modules.pop('utils.sync.pipeline', None)
@@ -3922,7 +3945,7 @@ async def test_sync_task_budget_expiry_keeps_409_when_cloud_tasks_dispatch_disab
     """Inline/local stacks without Cloud Tasks dispatch cannot schedule a
     replacement, so the budget expiry keeps the pre-deferral 409 semantics."""
 
-    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    module, saved_modules, _, _, fallback_calls, _ = _load_sync_router_for_fast_path()
     request = _configure_task_handler(
         module,
         pipeline_error=RuntimeError('pipeline must not complete'),
@@ -3947,6 +3970,7 @@ async def test_sync_task_budget_expiry_keeps_409_when_cloud_tasks_dispatch_disab
         assert response.status_code == 409
         assert json.loads(response.body) == {'status': 'locked'}
         module.enqueue_sync_job_budget_replacement.assert_not_called()
+        assert [call['reason'] for call in fallback_calls] == ['dispatch_disabled']
     finally:
         sys.modules.pop('routers.sync', None)
         sys.modules.pop('utils.sync.pipeline', None)
@@ -3955,6 +3979,112 @@ async def test_sync_task_budget_expiry_keeps_409_when_cloud_tasks_dispatch_disab
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sync_task_budget_deferral_chain_ends_at_queue_attempt_contract():
+    """Every replacement is a fresh named task whose queue retry count restarts
+    at zero, so the chain must bound itself: once the original delivery plus
+    replacements have spent the queue's attempt contract in whole-budget
+    attempts, no further replacement is scheduled. The 409 ends the task
+    through the queue with the lock still preserved for any live leaf; the
+    stale self-heal finalizes the job once that lock expires."""
+
+    module, saved_modules, _, _, fallback_calls, _ = _load_sync_router_for_fast_path()
+    request = _configure_task_handler(
+        module,
+        pipeline_error=RuntimeError('pipeline must not complete'),
+        latest_job={
+            'job_id': 'job-1',
+            'status': 'processing',
+            'stt_provider': 'deepgram',
+            'stt_model': 'nova-3',
+        },
+    )
+    max_attempts = module.get_sync_tasks_max_attempts()
+    request.json = AsyncMock(
+        return_value={
+            **(await request.json()),
+            module.SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY: max_attempts - 1,
+        }
+    )
+
+    async def _pipeline_that_never_finishes(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    try:
+        module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
+        module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        module.update_sync_job = MagicMock()
+
+        response = await module.run_sync_job(request, task_retry_count=0)
+
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'status': 'locked'}
+        module.enqueue_sync_job_budget_replacement.assert_not_called()
+        # No replacement is coming, so the job must stay eligible for the
+        # stale self-heal once the preserved lock expires.
+        module.update_sync_job.assert_not_called()
+        module.release_job_run_lock.assert_not_called()
+        module._finalize_sync_job_failure.assert_not_awaited()
+        assert [(call['reason'], call['outcome']) for call in fallback_calls] == [('deferrals_exhausted', 'exhausted')]
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+def test_sync_task_replacement_enqueue_timeout_fits_inside_route_margin():
+    """The replacement enqueue runs after the budget has expired, so its bound
+    must come out of the margin the configured budget actually leaves below the
+    route cap — an explicit override close to the cap must not let the
+    middleware 504 fire before the deferral response."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    resolve = module._resolve_sync_job_replacement_enqueue_timeout
+    try:
+        assert resolve(1500.0, 1380.0) == 60.0
+        assert resolve(30.0, 20.0) == 5.0
+        assert resolve(1500.0, 1490.0) == 5.0
+        assert (
+            module.SYNC_JOB_HANDLER_BUDGET_SECONDS + module.SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS
+            < module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS
+        )
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+def test_deferred_processing_job_is_not_stale_until_its_replacement_is_due():
+    """A budget-deferred job sits processing without a run lock between the
+    preserved lock's expiry and its scheduled replacement; polling must not
+    treat that planned silence as a lost owner, but must resume once the
+    replacement is overdue so a lost replacement still self-heals."""
+
+    sync_jobs, _ = _load_sync_jobs()
+    job = {
+        'status': 'processing',
+        'dispatch_mode': 'cloud_tasks',
+        'updated_at': 1_000.0,
+        'deferred_until': 5_000.0,
+    }
+    silent_past_threshold = 1_000.0 + sync_jobs.STALE_THRESHOLD_SECONDS + 1
+
+    assert sync_jobs.is_sync_job_stale(job, now=silent_past_threshold) is False
+    assert sync_jobs.is_sync_job_stale(job, now=4_999.0) is False
+    assert sync_jobs.is_sync_job_stale(job, now=5_000.0) is True
+    assert sync_jobs.is_sync_job_stale({**job, 'deferred_until': 'later'}, now=silent_past_threshold) is True
+    assert sync_jobs.is_sync_job_stale({**job, 'dispatch_mode': 'sequenced'}, now=6_000.0) is False
+    assert sync_jobs.is_sync_job_stale({**job, 'status': 'queued', 'attempt': 1}, now=6_000.0) is False
 
 
 @pytest.mark.asyncio
