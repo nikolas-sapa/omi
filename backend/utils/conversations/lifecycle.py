@@ -9,6 +9,7 @@ lifecycle fields directly.
 from __future__ import annotations
 
 from utils.observability.sync_phases import sync_phase
+from config.batch_pipeline import record_capture_eligible
 
 import logging
 import os
@@ -100,6 +101,8 @@ def _require_status(data: Mapping[str, Any], *allowed: ConversationStatus) -> No
 def create_in_progress_conversation(uid: str, conversation_data: dict[str, Any], *, idempotent: bool = False) -> bool:
     """Create the one durable in-progress resource for a recording generation."""
     _require_status(conversation_data, ConversationStatus.in_progress)
+    if record_capture_eligible(uid, conversation_data):
+        conversation_data['record_lane_owner'] = 'batch_live_v1'
     if idempotent:
         return conversations_db.create_conversation_if_absent_with_lifecycle(uid, conversation_data)
     conversations_db.upsert_conversation_with_lifecycle(uid, conversation_data)
@@ -938,7 +941,19 @@ def request_finalization(
         return dict(intent) | {'route': 'pusher'}
 
     try:
-        enqueue_listen_finalization_job(intent['job_id'], int(intent['dispatch_generation'] or 1))
+        from utils.conversations.demand_processing import schedule
+        from utils.cloud_tasks import listen_finalization_binding
+
+        generation = int(intent['dispatch_generation'] or 1)
+        if schedule(
+            uid,
+            intent['job_id'],
+            {'job_id': intent['job_id'], 'dispatch_generation': generation},
+            listen_finalization_binding(),
+            f"listen-finalization-{intent['job_id']}-{generation}",
+        ):
+            return dict(intent) | {'route': 'cloud_tasks'}
+        enqueue_listen_finalization_job(intent['job_id'], generation)
     except Exception:
         record_fallback(
             component='pusher',
