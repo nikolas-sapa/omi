@@ -2123,17 +2123,13 @@ def _budget_deferral_fallback(reason: str, outcome: str) -> JSONResponse:
 
 
 async def _mark_sync_job_deferred_until(job_id: str, deferred_until: float) -> None:
-    """Best-effort marker read by is_sync_job_stale: the preserved run lock
-    expires before the replacement is due, and a status poll in that unlocked
-    gap would otherwise acquire the lock and terminally fail a job whose
-    continuation is already scheduled."""
-    try:
-        await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': deferred_until})
-    except Exception as error:
-        logger.warning(
-            'event=sync_transcription_job outcome=handler_budget_deferral_marker_failed exception_type=%s',
-            type(error).__name__,
-        )
+    """Marker read by is_sync_job_stale: the preserved run lock expires before
+    the replacement is due, and a status poll in that unlocked gap would
+    otherwise acquire the lock and terminally fail a job whose continuation is
+    already scheduled. The write is required before the deferral ack — a lost
+    marker under a live replacement would leave that poll window unprotected —
+    so its failure falls back to the queue-owned 409 instead of acking dark."""
+    await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': deferred_until})
 
 
 async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONResponse:
@@ -2147,6 +2143,7 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
     try:
         payload = dict(await request.json())
         job_id = payload['job_id']
+        uid = payload['uid']
         deferrals = payload.get(SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY, 0)
         if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals < 0:
             raise ValueError('budget deferral count must be a non-negative integer')
@@ -2170,9 +2167,22 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
     payload[SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY] = deferrals + 1
     try:
         async with asyncio.timeout(SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS):
-            # Marker first: if the enqueue then fails, polling only resumes
-            # stale detection at the instant the replacement would have run.
-            await _mark_sync_job_deferred_until(job_id, schedule_at + STALE_THRESHOLD_SECONDS)
+            # Marker first, and required: the preserved run lock expires before
+            # the replacement is due, so without the marker a status poll in
+            # that unlocked gap can terminally fail the job before its
+            # continuation runs. A failed marker write therefore falls back to
+            # the queue-owned 409 rather than acking against an unprotected
+            # poll window.
+            try:
+                await _mark_sync_job_deferred_until(job_id, schedule_at + STALE_THRESHOLD_SECONDS)
+            except Exception as error:
+                logger.warning(
+                    'event=sync_transcription_job outcome=handler_budget_deferral_marker_failed exception_type=%s',
+                    type(error).__name__,
+                )
+                return _budget_deferral_fallback('marker_failed', 'degraded')
+            # If the enqueue now fails, polling only resumes stale detection
+            # at the instant the replacement would have run.
             await run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at)
     except Exception as error:
         logger.warning(
@@ -2180,6 +2190,30 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
             type(error).__name__,
         )
         return _budget_deferral_fallback('enqueue_failed', 'degraded')
+    if payload.get('sequencer_epoch') is not None:
+        # Sequenced deliveries only: a lease that expires before the delayed
+        # replacement begins makes the sweep redrive from the owner's original
+        # payload, which carries no chain count — persist this deferral on the
+        # owner so that redrive cannot restart the chain at zero. Best-effort:
+        # the task has been acknowledged, and a lost write here degrades to the
+        # pre-fix behavior for that one chain, not a dropped job. Bounded by
+        # the same margin-derived cap so the deferral response cannot outlive
+        # the route timeout after a successful enqueue.
+        try:
+            async with asyncio.timeout(SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS):
+                await run_blocking(
+                    db_executor,
+                    sync_backfill_sequencer.note_budget_deferral,
+                    uid,
+                    job_id,
+                    int(payload['sequencer_epoch']),
+                    deferrals + 1,
+                )
+        except Exception as error:
+            logger.warning(
+                'event=sync_transcription_job outcome=handler_budget_owner_deferral_write_failed exception_type=%s',
+                type(error).__name__,
+            )
     logger.info(
         'event=sync_transcription_job outcome=handler_budget_deferred replacement_at=%d deferrals=%d',
         schedule_at,
