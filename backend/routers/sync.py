@@ -34,6 +34,7 @@ from database.firestore_read_origin import read_origin
 from database.sync_jobs import (
     SyncLedgerFenceMode,
     TERMINAL_STATUSES,
+    RUN_LOCK_TTL_SECONDS,
     create_sync_job,
     delete_sync_job,
     delete_sync_job_run_lock_epoch,
@@ -80,6 +81,7 @@ from utils.other.storage import (
 from utils.byok import has_byok_keys
 from utils.cloud_tasks import (
     enqueue_sync_job,
+    enqueue_sync_job_budget_replacement,
     enqueue_audio_merge_job_deferred,
     get_sync_tasks_max_attempts,
     is_cloud_tasks_dispatch_enabled,
@@ -2019,7 +2021,11 @@ async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_
     finally:
         stop.set()
         await heartbeat
-    if response.status_code < 300:
+    if response.status_code < 300 and not _is_handler_budget_deferral(response):
+        # A budget deferral is an ack, not a completion claim: the epoch still
+        # owns the job and the delayed replacement (or the sweep's lease-expiry
+        # redrive) re-enters it, so the owner must not be finished here — and
+        # the nonterminal check below must not turn it into a retry-burning 500.
         job = await run_blocking(db_executor, get_sync_job, job_id)
         if job is not None and job.get('status') not in TERMINAL_STATUSES:
             logger.error('event=sync_uid_sequencer action=delivery outcome=nonterminal_ack')
@@ -2064,6 +2070,52 @@ SYNC_JOB_HANDLER_BUDGET_SECONDS = _resolve_sync_job_handler_budget(
     SYNC_JOB_ROUTE_TIMEOUT_SECONDS, os.environ.get('SYNC_JOB_HANDLER_BUDGET_SECONDS')
 )
 
+# A budget expiry preserves the run lock for its full TTL (RUN_LOCK_TTL_SECONDS,
+# 1800s), which outlives every queue-level Cloud Tasks retry: with the documented
+# five-attempt contract (utils/cloud_tasks.py get_sync_tasks_max_attempts) and the
+# queue's seconds-to-minutes backoff, a 409 would spend all remaining attempts
+# deferring against the held lock and exhaust the task before any delivery could
+# reacquire it, leaving the job nonterminal. The expired attempt therefore acks
+# and schedules one replacement named task for after the lock is guaranteed gone;
+# the 409 stays only as the fallback when no replacement could be scheduled.
+SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS = RUN_LOCK_TTL_SECONDS + 60
+# The replacement enqueue runs after the budget has expired, so it gets its own
+# bound inside the response margin instead of an unbounded create-task call.
+SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS = SYNC_JOB_RESPONSE_MARGIN_SECONDS / 2
+SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS = 'deferred_handler_budget'
+
+
+def _is_handler_budget_deferral(response: JSONResponse) -> bool:
+    try:
+        return json.loads(response.body).get('status') == SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS
+    except Exception:
+        return False
+
+
+async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONResponse:
+    """Ack a budget-expired attempt against a replacement scheduled past the
+    preserved run lock's TTL. Queue-level retries cannot outlive that lock, so
+    spending them now would exhaust the task on lock-held 409s; when no
+    replacement can be scheduled, the 409 fallback keeps the queue — not this
+    handler — owning the retry."""
+    if not is_cloud_tasks_dispatch_enabled():
+        return JSONResponse(status_code=409, content={'status': 'locked'})
+    try:
+        payload = await request.json()
+        schedule_at = int(time.time()) + SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
+        await asyncio.wait_for(
+            run_blocking(db_executor, enqueue_sync_job_budget_replacement, payload, schedule_at),
+            timeout=SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        logger.warning(
+            'event=sync_transcription_job outcome=handler_budget_replacement_failed exception_type=%s',
+            type(error).__name__,
+        )
+        return JSONResponse(status_code=409, content={'status': 'locked'})
+    logger.info('event=sync_transcription_job outcome=handler_budget_deferred replacement_at=%d', schedule_at)
+    return JSONResponse(status_code=200, content={'status': SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS})
+
 
 async def _run_sync_job_body(request: Request, task_retry_count: int):
     """Run one Cloud Tasks attempt inside the in-request budget.
@@ -2072,11 +2124,13 @@ async def _run_sync_job_body(request: Request, task_retry_count: int):
     admission, staged-file downloads, and the pipeline share one deadline
     instead of the pipeline budget starting only after pre-pipeline I/O. On
     expiry the attempt is cancelled exactly like a lost lease: the run lock
-    and staged audio stay held for the redelivery, and the 409 defers retry
-    until the lease expires, so a replacement attempt can never overlap an
-    executor leaf that cancellation cannot stop. (Post-attempt sequencer
-    cleanup in the caller stays outside the budget on purpose: once an
-    attempt has produced its response, expiring there must not rewrite it.)
+    and staged audio stay held, so a replacement attempt can never overlap an
+    executor leaf that cancellation cannot stop. Because that lock outlives
+    every queue-level retry, the attempt acks and schedules one delayed
+    replacement instead of returning a 409 that would burn the task's retry
+    budget against the preserved lock. (Post-attempt sequencer cleanup in the
+    caller stays outside the budget on purpose: once an attempt has produced
+    its response, expiring there must not rewrite it.)
     """
     budget = asyncio.timeout(SYNC_JOB_HANDLER_BUDGET_SECONDS)
     try:
@@ -2086,7 +2140,7 @@ async def _run_sync_job_body(request: Request, task_retry_count: int):
         if not budget.expired():
             raise
         logger.warning('event=sync_transcription_job outcome=handler_budget_expired lock=preserved')
-        return JSONResponse(status_code=409, content={'status': 'locked'})
+        return await _defer_sync_job_after_handler_budget_expiry(request)
 
 
 @sync_attempt

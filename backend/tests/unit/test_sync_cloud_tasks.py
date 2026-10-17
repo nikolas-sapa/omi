@@ -1340,6 +1340,7 @@ def _load_sync_router_for_fast_path():
     )
     mock_sync_jobs.mark_job_queued_for_retry = MagicMock()
     mock_sync_jobs.try_acquire_job_run_lock = MagicMock(return_value='legacy-lock-token')
+    mock_sync_jobs.RUN_LOCK_TTL_SECONDS = 1800
     sys.modules['database.sync_jobs'] = mock_sync_jobs
 
     sys.modules['utils.fair_use'].is_hard_restricted = MagicMock(return_value=False)
@@ -3790,15 +3791,27 @@ async def test_sync_task_pipeline_budget_ends_attempt_before_platform_timeout():
         assert 0 < module.SYNC_JOB_HANDLER_BUDGET_SECONDS < module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS
         module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
         module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        before = time.time()
 
         response = await module.run_sync_job(request, task_retry_count=0)
 
         # A budget expiry is a lease loss, not a generic retry: an executor
         # leaf can still be mutating state under this token, so the job stays
         # owned (no queued-reset, no terminal failure, no staged-blob delete,
-        # no lock release) and the 409 defers redelivery until the lease TTL.
-        assert response.status_code == 409
-        assert json.loads(response.body) == {'status': 'locked'}
+        # no lock release). The preserved lock outlives every queue-level
+        # retry, so instead of a 409 that would burn the task's remaining
+        # attempts against it, the attempt acks and schedules one replacement
+        # named task past the lock's TTL.
+        assert response.status_code == 200
+        assert json.loads(response.body) == {'status': module.SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS}
+        module.enqueue_sync_job_budget_replacement.assert_called_once()
+        payload, schedule_at = module.enqueue_sync_job_budget_replacement.call_args.args
+        assert payload['job_id'] == 'job-1'
+        assert (
+            before + module.RUN_LOCK_TTL_SECONDS
+            <= schedule_at
+            <= time.time() + module.SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
+        )
         module.fenced_mark_job_queued_for_retry.assert_not_called()
         module._finalize_sync_job_failure.assert_not_awaited()
         module._delete_staged_blobs_async.assert_not_awaited()
@@ -3845,12 +3858,136 @@ async def test_sync_task_budget_counts_pre_pipeline_io_from_handler_entry():
 
         response = await module.run_sync_job(request, task_retry_count=0)
 
-        assert response.status_code == 409
-        assert json.loads(response.body) == {'status': 'locked'}
+        assert response.status_code == 200
+        assert json.loads(response.body) == {'status': module.SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS}
+        module.enqueue_sync_job_budget_replacement.assert_called_once()
         module._run_full_pipeline_background_async.assert_not_awaited()
         module._finalize_sync_job_failure.assert_not_awaited()
         module._delete_staged_blobs_async.assert_not_awaited()
         module.release_job_run_lock.assert_not_called()
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sync_task_budget_expiry_falls_back_to_409_when_replacement_not_schedulable():
+    """The deferred ack must never drop the job: when the replacement task
+    cannot be scheduled, the 409 keeps Cloud Tasks' own retry owning the
+    redelivery exactly as before, preserved lock and all."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    request = _configure_task_handler(
+        module,
+        pipeline_error=RuntimeError('pipeline must not complete'),
+        latest_job={
+            'job_id': 'job-1',
+            'status': 'processing',
+            'stt_provider': 'deepgram',
+            'stt_model': 'nova-3',
+        },
+    )
+
+    async def _pipeline_that_never_finishes(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    try:
+        module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
+        module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        module.enqueue_sync_job_budget_replacement = MagicMock(side_effect=RuntimeError('create_task failed'))
+
+        response = await module.run_sync_job(request, task_retry_count=0)
+
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'status': 'locked'}
+        module.enqueue_sync_job_budget_replacement.assert_called_once()
+        module.release_job_run_lock.assert_not_called()
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sync_task_budget_expiry_keeps_409_when_cloud_tasks_dispatch_disabled():
+    """Inline/local stacks without Cloud Tasks dispatch cannot schedule a
+    replacement, so the budget expiry keeps the pre-deferral 409 semantics."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    request = _configure_task_handler(
+        module,
+        pipeline_error=RuntimeError('pipeline must not complete'),
+        latest_job={
+            'job_id': 'job-1',
+            'status': 'processing',
+            'stt_provider': 'deepgram',
+            'stt_model': 'nova-3',
+        },
+    )
+
+    async def _pipeline_that_never_finishes(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    try:
+        module.SYNC_JOB_HANDLER_BUDGET_SECONDS = 0.05
+        module._run_full_pipeline_background_async = _pipeline_that_never_finishes
+        module.is_cloud_tasks_dispatch_enabled = MagicMock(return_value=False)
+
+        response = await module.run_sync_job(request, task_retry_count=0)
+
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'status': 'locked'}
+        module.enqueue_sync_job_budget_replacement.assert_not_called()
+    finally:
+        sys.modules.pop('routers.sync', None)
+        sys.modules.pop('utils.sync.pipeline', None)
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+@pytest.mark.asyncio
+async def test_sequenced_budget_deferral_acks_without_finishing_sequencer_owner():
+    """A budget-expired sequenced delivery is an ack, not a completion claim:
+    the job is nonterminal and still owned by its epoch, so the wrapper must
+    pass the deferral through instead of converting it into a retry-burning
+    nonterminal_ack 500 or finishing the owner out from under the job."""
+
+    module, saved_modules, _, _, _, _ = _load_sync_router_for_fast_path()
+    request = MagicMock()
+    request.json = AsyncMock(return_value={'uid': 'test-uid', 'job_id': 'job-1', 'sequencer_epoch': 3})
+    module.TERMINAL_STATUSES = ('completed', 'failed', 'partial_failure')
+    module.sync_backfill_sequencer.HEARTBEAT_SECONDS = 120
+    module.sync_backfill_sequencer.begin_job = MagicMock(return_value=True)
+    module.sync_backfill_sequencer.finish_job = MagicMock(return_value=True)
+    module.uid_sequencer.kick = MagicMock(return_value=True)
+    module.get_sync_job = MagicMock(return_value={'status': 'processing', 'attempt': 1})
+    module.start_background_task = lambda coro, *, name: asyncio.create_task(coro, name=name)
+    module._run_sync_job_body = AsyncMock(
+        return_value=module.JSONResponse(
+            status_code=200, content={'status': module.SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS}
+        )
+    )
+    try:
+        deferred = await module.run_sync_job(request, task_retry_count=0)
+
+        assert deferred.status_code == 200
+        assert json.loads(deferred.body)['status'] == module.SYNC_JOB_HANDLER_BUDGET_DEFERRED_STATUS
+        module.get_sync_job.assert_called_with('job-1')  # prior-attempt read only
+        assert module.get_sync_job.call_count == 1
+        module.sync_backfill_sequencer.finish_job.assert_not_called()
+        module.uid_sequencer.kick.assert_not_called()
     finally:
         sys.modules.pop('routers.sync', None)
         sys.modules.pop('utils.sync.pipeline', None)

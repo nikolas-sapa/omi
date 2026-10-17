@@ -329,7 +329,11 @@ def enqueue_sync_job(payload: Dict[str, Any], *, dispatch_attempt: int = 0) -> N
         if sequencer_epoch is None or dispatch_attempt < 0:
             raise ValueError('sync job dispatch attempt requires a sequencer epoch and a positive value')
         task_id += f'-d{dispatch_attempt}'
-    schedule_at = direct_schedule_at(payload)
+    _enqueue_sync_job_routed(payload, task_id, direct_schedule_at(payload))
+
+
+def _enqueue_sync_job_routed(payload: Dict[str, Any], task_id: str, schedule_at: Optional[int]) -> None:
+    """Create one named sync-job task, preferring the gated backfill queue."""
     schedule_options: Dict[str, Any] = {'schedule_at': schedule_at} if schedule_at is not None else {}
     if payload.get('lane') == 'backfill' and is_sync_backfill_routing_enabled():
         queue = os.getenv('SYNC_BACKFILL_TASKS_QUEUE', '').strip()
@@ -345,6 +349,21 @@ def enqueue_sync_job(payload: Dict[str, Any], *, dispatch_attempt: int = 0) -> N
             )
             return
     enqueue_named_task(os.getenv('SYNC_TASKS_QUEUE', ''), _handler_url(), task_id, payload, **schedule_options)
+
+
+def enqueue_sync_job_budget_replacement(payload: Dict[str, Any], schedule_at: int) -> None:
+    """Schedule the delayed replacement for a handler-budget expiry.
+
+    The completing task's own name stays tombstoned by Cloud Tasks for about
+    an hour, so the replacement embeds the schedule in its ``-rb`` name:
+    concurrent expiries deduplicate, and a later expiry of the same job gets a
+    fresh name instead of being swallowed. The caller schedules past the
+    preserved run lock's TTL so the replacement never defers against its own
+    predecessor.
+    """
+    if not sync_job_payload_keys_valid(payload):
+        raise ValueError('sync job payload does not match the durable worker schema')
+    _enqueue_sync_job_routed(payload, f"{payload['job_id']}-rb{schedule_at}", schedule_at)
 
 
 def enqueue_sync_uid_wake(uid: str, uid_hash: str, deadline: int) -> None:
