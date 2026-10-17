@@ -81,6 +81,7 @@ from utils.other.storage import (
 )
 from utils.byok import has_byok_keys
 from utils.cloud_tasks import (
+    DISPATCH_DEADLINE_SECONDS,
     enqueue_sync_job,
     enqueue_sync_job_budget_replacement,
     enqueue_audio_merge_job_deferred,
@@ -2042,27 +2043,39 @@ async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_
 # 504 without cancelling the pipeline coroutine, so on Starlette's
 # BaseHTTPMiddleware the request stays open until the pipeline returns and
 # Cloud Run terminates it at the service's maximum request timeout instead.
-# The handler must end the attempt itself, below that cap, so Cloud Tasks gets
-# its retry response in time. The budget below therefore defaults to the
-# configured route timeout minus a fixed response margin; an explicit env
-# override still wins (the local stacks set 20s under a 30s route timeout),
-# but any budget that is not strictly below the route cap fails at startup —
-# that configuration reproduces the exact lingering-request path this cap
-# exists to prevent.
+# The handler must end the attempt itself, below every wall that can end it
+# first: the middleware cap, the dispatch deadline every named task carries
+# (utils/cloud_tasks.py DISPATCH_DEADLINE_SECONDS — past it the queue retries
+# while this handler still runs), and the run lock's TTL (past it a retry can
+# reacquire the lock the budget still holds). The budget below therefore
+# defaults to the earliest of those walls minus a fixed response margin; an
+# explicit env override still wins (the local stacks set 20s under a 30s route
+# timeout), but any budget that is not strictly below all three fails at
+# startup — that configuration reproduces the exact lingering-request path
+# this cap exists to prevent.
 SYNC_JOB_RESPONSE_MARGIN_SECONDS = 120.0
 SYNC_JOB_ROUTE_TIMEOUT_SECONDS = float(os.environ.get('HTTP_SYNC_JOBS_RUN_TIMEOUT') or 1500)
 
 
-def _resolve_sync_job_handler_budget(route_timeout_seconds: float, override: Optional[str]) -> float:
+def _resolve_sync_job_handler_budget(
+    route_timeout_seconds: float,
+    override: Optional[str],
+    *,
+    dispatch_deadline_seconds: float = DISPATCH_DEADLINE_SECONDS,
+    run_lock_ttl_seconds: float = RUN_LOCK_TTL_SECONDS,
+) -> float:
+    attempt_cap_seconds = min(route_timeout_seconds, dispatch_deadline_seconds, run_lock_ttl_seconds)
     budget_seconds = (
-        float(override) if override not in (None, '') else (route_timeout_seconds - SYNC_JOB_RESPONSE_MARGIN_SECONDS)
+        float(override) if override not in (None, '') else (attempt_cap_seconds - SYNC_JOB_RESPONSE_MARGIN_SECONDS)
     )
-    if not 0 < budget_seconds < route_timeout_seconds:
+    if not 0 < budget_seconds < attempt_cap_seconds:
         raise ValueError(
-            'SYNC_JOB_HANDLER_BUDGET_SECONDS must be positive and strictly below '
-            f'HTTP_SYNC_JOBS_RUN_TIMEOUT (got {budget_seconds!r} for a route timeout '
-            f'of {route_timeout_seconds!r}); otherwise the middleware 504 fires first '
-            'and the lingering-request path returns'
+            'SYNC_JOB_HANDLER_BUDGET_SECONDS must be positive and strictly below the '
+            'earliest attempt wall — HTTP_SYNC_JOBS_RUN_TIMEOUT, the Cloud Tasks '
+            f'dispatch deadline ({dispatch_deadline_seconds!r}s), and the run lock TTL '
+            f'({run_lock_ttl_seconds!r}s), i.e. below {attempt_cap_seconds!r}s — '
+            f'otherwise the queue retries the attempt while this handler still owns '
+            f'it and the lingering-request path returns (got {budget_seconds!r})'
         )
     return budget_seconds
 
@@ -2072,9 +2085,11 @@ SYNC_JOB_HANDLER_BUDGET_SECONDS = _resolve_sync_job_handler_budget(
 )
 
 # A budget expiry preserves the run lock for its full TTL (RUN_LOCK_TTL_SECONDS,
-# 1800s), which outlives every queue-level Cloud Tasks retry: with the documented
-# five-attempt contract (utils/cloud_tasks.py get_sync_tasks_max_attempts) and the
-# queue's seconds-to-minutes backoff, a 409 would spend all remaining attempts
+# 1800s), which outlives every queue-level Cloud Tasks retry: with the
+# five-attempt queue contract (provisioned as --max-attempts=5 by
+# .github/actions/sync-backfill-lifecycle/action.yml and mirrored by
+# utils/cloud_tasks.py get_sync_tasks_max_attempts) and the queue's
+# seconds-to-minutes backoff, a 409 would spend all remaining attempts
 # deferring against the held lock and exhaust the task before any delivery could
 # reacquire it, leaving the job nonterminal. The expired attempt therefore acks
 # and schedules one replacement named task for after the lock is guaranteed gone;
@@ -2129,7 +2144,12 @@ async def _mark_sync_job_deferred_until(job_id: str, deferred_until: float) -> N
     already scheduled. The write is required before the deferral ack — a lost
     marker under a live replacement would leave that poll window unprotected —
     so its failure falls back to the queue-owned 409 instead of acking dark."""
-    await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': deferred_until})
+    updated = await run_blocking(db_executor, update_sync_job, job_id, {'deferred_until': deferred_until})
+    if updated is None:
+        # update_sync_job's failure sentinel: a missing/nonmutable job or a
+        # CAS that lost every retry. The marker is not on the job, so the
+        # deferral must not continue as if it were.
+        raise RuntimeError('deferred marker write did not apply')
 
 
 async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONResponse:
@@ -2165,8 +2185,13 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
         return _budget_deferral_fallback('deferrals_exhausted', 'exhausted')
     schedule_at = int(time.time()) + SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS
     payload[SYNC_JOB_BUDGET_DEFERRALS_PAYLOAD_KEY] = deferrals + 1
+    # One absolute deadline for all post-budget work — marker, replacement
+    # enqueue, and the sequencer-owner count below: each block getting its own
+    # margin-sized timeout would sum to the whole route margin, letting the
+    # middleware 504 fire before the deferral response is returned.
+    post_budget_deadline = time.monotonic() + SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS
     try:
-        async with asyncio.timeout(SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS):
+        async with asyncio.timeout_at(post_budget_deadline):
             # Marker first, and required: the preserved run lock expires before
             # the replacement is due, so without the marker a status poll in
             # that unlocked gap can terminally fail the job before its
@@ -2195,12 +2220,13 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
         # replacement begins makes the sweep redrive from the owner's original
         # payload, which carries no chain count — persist this deferral on the
         # owner so that redrive cannot restart the chain at zero. Best-effort:
-        # the task has been acknowledged, and a lost write here degrades to the
-        # pre-fix behavior for that one chain, not a dropped job. Bounded by
-        # the same margin-derived cap so the deferral response cannot outlive
-        # the route timeout after a successful enqueue.
+        # the task has been acknowledged, and a lost write degrades to the
+        # pre-fix behavior for that one chain, not a dropped job — recorded so
+        # the lost bound stays visible to operators. Shares the deadline above,
+        # so a slow enqueue leaves this write whatever margin remains instead
+        # of a fresh margin-sized timeout.
         try:
-            async with asyncio.timeout(SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS):
+            async with asyncio.timeout_at(post_budget_deadline):
                 await run_blocking(
                     db_executor,
                     sync_backfill_sequencer.note_budget_deferral,
@@ -2213,6 +2239,13 @@ async def _defer_sync_job_after_handler_budget_expiry(request: Request) -> JSONR
             logger.warning(
                 'event=sync_transcription_job outcome=handler_budget_owner_deferral_write_failed exception_type=%s',
                 type(error).__name__,
+            )
+            record_fallback(
+                component='sync_dispatch',
+                from_mode='budget_replacement',
+                to_mode='lease_expiry_redrive',
+                reason='owner_write_failed',
+                outcome='degraded',
             )
     logger.info(
         'event=sync_transcription_job outcome=handler_budget_deferred replacement_at=%d deferrals=%d',
