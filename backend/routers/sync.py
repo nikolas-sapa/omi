@@ -2097,12 +2097,22 @@ SYNC_JOB_HANDLER_BUDGET_SECONDS = _resolve_sync_job_handler_budget(
 SYNC_JOB_BUDGET_REPLACEMENT_DELAY_SECONDS = RUN_LOCK_TTL_SECONDS + 60
 
 
-def _resolve_sync_job_replacement_enqueue_timeout(route_timeout_seconds: float, budget_seconds: float) -> float:
+def _resolve_sync_job_replacement_enqueue_timeout(
+    route_timeout_seconds: float,
+    budget_seconds: float,
+    *,
+    dispatch_deadline_seconds: float = DISPATCH_DEADLINE_SECONDS,
+    run_lock_ttl_seconds: float = RUN_LOCK_TTL_SECONDS,
+) -> float:
     # The replacement enqueue runs after the budget has expired, so it must fit
-    # inside the margin the configured budget actually leaves below the route
-    # cap — half of it, the other half being response headroom — rather than a
-    # fixed fraction of the default margin that an explicit override can exceed.
-    return (route_timeout_seconds - budget_seconds) / 2
+    # inside the margin the configured budget actually leaves below the earliest
+    # attempt wall — the same minimum of route cap, dispatch deadline, and run
+    # lock TTL that caps the budget, with the other half as response headroom —
+    # rather than a fixed fraction of the default margin that an explicit
+    # override can exceed, or a route cap above the dispatch deadline, which
+    # would let post-budget work cross the wall Cloud Tasks ends the attempt at.
+    attempt_cap_seconds = min(route_timeout_seconds, dispatch_deadline_seconds, run_lock_ttl_seconds)
+    return (attempt_cap_seconds - budget_seconds) / 2
 
 
 SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS = _resolve_sync_job_replacement_enqueue_timeout(

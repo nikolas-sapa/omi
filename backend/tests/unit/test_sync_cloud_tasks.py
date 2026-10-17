@@ -4053,9 +4053,18 @@ def test_sync_task_replacement_enqueue_timeout_fits_inside_route_margin():
         assert resolve(1500.0, 1380.0) == 60.0
         assert resolve(30.0, 20.0) == 5.0
         assert resolve(1500.0, 1490.0) == 5.0
+        # The margin is measured below the earliest attempt wall, not only the
+        # route cap: a route timeout above the 1500s dispatch deadline must not
+        # buy post-budget work another margin the queue ends the attempt first.
+        assert resolve(1800.0, 1380.0) == 60.0
+        assert resolve(1500.0, 1380.0, run_lock_ttl_seconds=1600.0) == 60.0
         assert (
             module.SYNC_JOB_HANDLER_BUDGET_SECONDS + module.SYNC_JOB_BUDGET_REPLACEMENT_ENQUEUE_TIMEOUT_SECONDS
-            < module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS
+            < min(
+                module.SYNC_JOB_ROUTE_TIMEOUT_SECONDS,
+                module.DISPATCH_DEADLINE_SECONDS,
+                module.RUN_LOCK_TTL_SECONDS,
+            )
         )
     finally:
         sys.modules.pop('routers.sync', None)
